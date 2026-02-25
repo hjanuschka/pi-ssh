@@ -309,8 +309,12 @@ class PersistentRemoteShell {
     const remoteCwd = mapLocalPathToRemote(cwd, this.connection);
 
     const wrappedCommand = [
-      `(cd -- ${shellQuote(remoteCwd)} && { ${command}; })`,
-      "__pi_ec=$?",
+      `if cd -- ${shellQuote(remoteCwd)}; then`,
+      `  { ${command}; }`,
+      "  __pi_ec=$?",
+      "else",
+      "  __pi_ec=$?",
+      "fi",
       `printf '${marker}:%s\\n' \"$__pi_ec\"`,
     ].join("\n");
 
