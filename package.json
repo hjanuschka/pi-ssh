@@ -1,6 +1,6 @@
 {
   "name": "pi-ssh",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "pi extension for local-model plus remote SSH workspace tool execution",
   "type": "module",
   "private": false,
