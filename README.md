@@ -24,6 +24,9 @@ This is useful when:
   - `write`
   - `edit`
   - `bash`
+- Persistent remote shell session for bash commands
+  - environment persists across commands (for example `export TEST=123`)
+  - Ctrl-C interrupts the current remote command but keeps the SSH session alive
 - Remote execution for user `!` commands
 - Status indicator in the pi UI when SSH mode is active
 - System prompt cwd rewrite to reflect remote cwd

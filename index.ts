@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import {
   createBashTool,
@@ -23,8 +23,27 @@ interface SshCaptureOptions {
   signal?: AbortSignal;
 }
 
+interface RunningCommand {
+  marker: string;
+  timeout?: number;
+  onData: (chunk: Buffer) => void;
+  signal?: AbortSignal;
+  aborted: boolean;
+  timedOut: boolean;
+  timeoutHandle?: NodeJS.Timeout;
+  abortHandler?: () => void;
+  stdoutChunks: Buffer[];
+  stderrChunks: Buffer[];
+  resolve: (value: { exitCode: number | null }) => void;
+  reject: (error: Error) => void;
+}
+
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function mapLocalPathToRemote(path: string, conn: SshConnection): string {
@@ -58,8 +77,6 @@ function parseSshFlag(raw: string): { remote: string; remotePath?: string } {
 }
 
 function buildResolveRemotePathCommand(remotePath: string): string {
-  // The path argument is always shell quoted for safety.
-  // Use absolute paths for best reliability.
   return `cd -- ${shellQuote(remotePath)} && pwd`;
 }
 
@@ -134,6 +151,209 @@ async function sshExec(remote: string, remoteCommand: string, options: SshCaptur
   return result.stdout;
 }
 
+class PersistentRemoteShell {
+  private connection: SshConnection;
+  private child: ChildProcessWithoutNullStreams | null = null;
+  private running: RunningCommand | null = null;
+  private queueTail: Promise<void> = Promise.resolve();
+  private disposed = false;
+
+  constructor(connection: SshConnection) {
+    this.connection = connection;
+  }
+
+  async dispose(): Promise<void> {
+    this.disposed = true;
+    if (this.running) {
+      this.running.reject(new Error("Remote shell disposed"));
+      this.running = null;
+    }
+    if (this.child && !this.child.killed) {
+      this.child.kill();
+    }
+    this.child = null;
+  }
+
+  exec(command: string, cwd: string, options: { onData: (data: Buffer) => void; signal?: AbortSignal; timeout?: number }): Promise<{ exitCode: number | null }> {
+    const run = this.queueTail.then(() => this.execOne(command, cwd, options));
+    this.queueTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async ensureStarted(): Promise<void> {
+    if (this.disposed) {
+      throw new Error("Remote shell is disposed");
+    }
+    if (this.child && !this.child.killed) {
+      return;
+    }
+
+    const startup = [
+      `cd -- ${shellQuote(this.connection.remoteCwd)}`,
+      "stty -echo 2>/dev/null || true",
+      "export PS1=''",
+      "export PROMPT_COMMAND=''",
+      "exec bash --noprofile --norc",
+    ].join(" && ");
+
+    const child = spawn("ssh", ["-tt", this.connection.remote, "bash", "-lc", startup], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    child.on("error", (error) => {
+      if (this.running) {
+        this.running.reject(error instanceof Error ? error : new Error(String(error)));
+        this.cleanupRunning();
+      }
+    });
+
+    child.on("close", () => {
+      if (this.running) {
+        this.running.reject(new Error("SSH shell closed unexpectedly"));
+        this.cleanupRunning();
+      }
+      this.child = null;
+    });
+
+    child.stdout.on("data", (chunk: Buffer) => this.handleStdout(chunk));
+    child.stderr.on("data", (chunk: Buffer) => this.handleStderr(chunk));
+
+    this.child = child;
+  }
+
+  private handleStdout(chunk: Buffer): void {
+    const running = this.running;
+    if (!running) return;
+    running.stdoutChunks.push(chunk);
+    this.tryCompleteRunning();
+  }
+
+  private handleStderr(chunk: Buffer): void {
+    const running = this.running;
+    if (!running) return;
+    running.stderrChunks.push(chunk);
+  }
+
+  private tryCompleteRunning(): void {
+    const running = this.running;
+    if (!running) return;
+
+    const stdoutText = Buffer.concat(running.stdoutChunks).toString("utf-8");
+    const regex = new RegExp(`${escapeRegex(running.marker)}:(-?\\d+)`);
+    const match = regex.exec(stdoutText);
+    if (!match) return;
+
+    const markerStart = match.index;
+    const markerEnd = markerStart + match[0].length;
+    const stdoutBefore = stdoutText.slice(0, markerStart);
+    const _trailing = stdoutText.slice(markerEnd);
+
+    const cleanStdout = Buffer.from(stdoutBefore, "utf-8");
+    const cleanStderr = Buffer.concat(running.stderrChunks);
+    const merged = Buffer.concat([cleanStdout, cleanStderr]);
+    if (merged.length > 0) {
+      running.onData(merged);
+    }
+
+    const parsedExitCode = Number(match[1]);
+    const exitCode = Number.isNaN(parsedExitCode) ? null : parsedExitCode;
+
+    const timedOut = running.timedOut;
+    const aborted = running.aborted;
+    const timeout = running.timeout;
+
+    this.cleanupRunning();
+
+    if (timedOut) {
+      running.reject(new Error(`timeout:${timeout}`));
+      return;
+    }
+    if (aborted) {
+      running.reject(new Error("aborted"));
+      return;
+    }
+
+    running.resolve({ exitCode });
+  }
+
+  private cleanupRunning(): void {
+    if (!this.running) return;
+    if (this.running.timeoutHandle) clearTimeout(this.running.timeoutHandle);
+    if (this.running.signal && this.running.abortHandler) {
+      this.running.signal.removeEventListener("abort", this.running.abortHandler);
+    }
+    this.running = null;
+  }
+
+  private interruptCurrentCommand(): void {
+    if (!this.child || this.child.killed) return;
+    // Send Ctrl-C to remote TTY; this interrupts the foreground command
+    // but keeps the SSH shell session alive.
+    this.child.stdin.write("\x03");
+  }
+
+  private async execOne(
+    command: string,
+    cwd: string,
+    options: { onData: (data: Buffer) => void; signal?: AbortSignal; timeout?: number },
+  ): Promise<{ exitCode: number | null }> {
+    await this.ensureStarted();
+    if (!this.child || this.child.killed) {
+      throw new Error("Failed to start persistent SSH shell");
+    }
+
+    const marker = `__PI_SSH_DONE_${Date.now()}_${Math.random().toString(16).slice(2)}__`;
+    const remoteCwd = mapLocalPathToRemote(cwd, this.connection);
+
+    const wrappedCommand = [
+      `(cd -- ${shellQuote(remoteCwd)} && { ${command}; })`,
+      "__pi_ec=$?",
+      `printf '${marker}:%s\\n' \"$__pi_ec\"`,
+    ].join("\n");
+
+    return new Promise((resolve, reject) => {
+      const running: RunningCommand = {
+        marker,
+        timeout: options.timeout,
+        onData: options.onData,
+        signal: options.signal,
+        aborted: false,
+        timedOut: false,
+        stdoutChunks: [],
+        stderrChunks: [],
+        resolve,
+        reject,
+      };
+
+      if (options.timeout && options.timeout > 0) {
+        running.timeoutHandle = setTimeout(() => {
+          running.timedOut = true;
+          this.interruptCurrentCommand();
+        }, options.timeout * 1000);
+      }
+
+      if (options.signal) {
+        running.abortHandler = () => {
+          running.aborted = true;
+          this.interruptCurrentCommand();
+        };
+
+        if (options.signal.aborted) {
+          running.abortHandler();
+        } else {
+          options.signal.addEventListener("abort", running.abortHandler, { once: true });
+        }
+      }
+
+      this.running = running;
+      this.child?.stdin.write(`${wrappedCommand}\n`);
+    });
+  }
+}
+
 function createRemoteReadOps(conn: SshConnection): ReadOperations {
   return {
     readFile: (absolutePath) => {
@@ -192,60 +412,11 @@ function createRemoteEditOps(conn: SshConnection): EditOperations {
   };
 }
 
-function createRemoteBashOps(conn: SshConnection): BashOperations {
+function createRemoteBashOps(shell: PersistentRemoteShell): BashOperations {
   return {
-    exec: (command, cwd, { onData, signal, timeout }) =>
-      new Promise((resolve, reject) => {
-        const remoteCwd = mapLocalPathToRemote(cwd, conn);
-        const remoteCommand = `cd -- ${shellQuote(remoteCwd)} && ${command}`;
-
-        const child = spawn("ssh", [conn.remote, "bash", "-lc", remoteCommand], {
-          stdio: ["ignore", "pipe", "pipe"],
-        });
-
-        let timedOut = false;
-        const timeoutHandle =
-          timeout && timeout > 0
-            ? setTimeout(() => {
-                timedOut = true;
-                child.kill();
-              }, timeout * 1000)
-            : undefined;
-
-        const onAbort = () => child.kill();
-        if (signal) {
-          if (signal.aborted) {
-            child.kill();
-          } else {
-            signal.addEventListener("abort", onAbort, { once: true });
-          }
-        }
-
-        child.stdout?.on("data", onData);
-        child.stderr?.on("data", onData);
-
-        child.on("error", (error) => {
-          if (timeoutHandle) clearTimeout(timeoutHandle);
-          if (signal) signal.removeEventListener("abort", onAbort);
-          reject(error);
-        });
-
-        child.on("close", (exitCode) => {
-          if (timeoutHandle) clearTimeout(timeoutHandle);
-          if (signal) signal.removeEventListener("abort", onAbort);
-
-          if (signal?.aborted) {
-            reject(new Error("aborted"));
-            return;
-          }
-          if (timedOut) {
-            reject(new Error(`timeout:${timeout}`));
-            return;
-          }
-
-          resolve({ exitCode });
-        });
-      }),
+    exec: (command, cwd, { onData, signal, timeout }) => {
+      return shell.exec(command, cwd, { onData, signal, timeout });
+    },
   };
 }
 
@@ -286,6 +457,7 @@ export default function piSshExtension(pi: ExtensionAPI): void {
   const localBash = createBashTool(localCwd);
 
   let connection: SshConnection | null = null;
+  let persistentShell: PersistentRemoteShell | null = null;
 
   const getConnection = () => connection;
 
@@ -328,11 +500,11 @@ export default function piSshExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     ...localBash,
     async execute(id, params, signal, onUpdate) {
-      const conn = getConnection();
-      if (!conn) {
+      const shell = persistentShell;
+      if (!shell) {
         return localBash.execute(id, params, signal, onUpdate);
       }
-      const tool = createBashTool(localCwd, { operations: createRemoteBashOps(conn) });
+      const tool = createBashTool(localCwd, { operations: createRemoteBashOps(shell) });
       return tool.execute(id, params, signal, onUpdate);
     },
   });
@@ -343,6 +515,7 @@ export default function piSshExtension(pi: ExtensionAPI): void {
 
     try {
       connection = await resolveSshConnection(flag, localCwd);
+      persistentShell = new PersistentRemoteShell(connection);
       const enabledMessage = `pi-ssh enabled: ${connection.remote}:${connection.remoteCwd}`;
       console.log(enabledMessage);
       if (ctx.hasUI) {
@@ -355,6 +528,10 @@ export default function piSshExtension(pi: ExtensionAPI): void {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       connection = null;
+      if (persistentShell) {
+        await persistentShell.dispose();
+        persistentShell = null;
+      }
       console.error(`pi-ssh failed to connect: ${message}`);
       if (ctx.hasUI) {
         ctx.ui.setStatus("pi-ssh", undefined);
@@ -364,10 +541,17 @@ export default function piSshExtension(pi: ExtensionAPI): void {
     }
   });
 
+  pi.on("session_shutdown", async () => {
+    if (persistentShell) {
+      await persistentShell.dispose();
+      persistentShell = null;
+    }
+  });
+
   pi.on("user_bash", () => {
-    const conn = getConnection();
-    if (!conn) return;
-    return { operations: createRemoteBashOps(conn) };
+    const shell = persistentShell;
+    if (!shell) return;
+    return { operations: createRemoteBashOps(shell) };
   });
 
   pi.on("before_agent_start", async (event) => {

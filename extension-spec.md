@@ -39,8 +39,7 @@ We want a third mode:
 
 ## Non-goals (MVP)
 
-- Persistent remote shell session multiplexing
-- Full connection pooling and retry policy
+- Full connection pooling and retry policy beyond one persistent shell
 - Agent-side bidirectional tunnel protocol
 - Remote model proxying
 
@@ -117,7 +116,8 @@ Use Option A as the first publishable OSS cut.
 
 - pi starts locally
 - if `--ssh` is set, extension enters remote mode
-- all overridden tools delegate to remote ops
+- `bash` and user `!` commands run through one persistent remote shell session
+- `read`/`write`/`edit` delegate to remote ops over SSH
 - if `--ssh` is not set, local tools are used
 
 ### UX behavior
@@ -125,6 +125,8 @@ Use Option A as the first publishable OSS cut.
 - status line shows active SSH target
 - startup notification confirms mode
 - `!` user bash commands also execute remotely
+- bash environment persists during session (for example exported vars)
+- Ctrl-C interrupts current remote command while keeping SSH shell alive
 - system prompt cwd line is rewritten to remote cwd
 
 ### Safety
