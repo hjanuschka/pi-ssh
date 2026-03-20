@@ -587,7 +587,14 @@ class SshTransport implements RemoteTransport {
   }
 
   async readFile(remotePath: string): Promise<Buffer> {
-    return this.runChecked(`cat -- ${shellQuote(remotePath)}`);
+    // Read files over a one-shot SSH exec so bytes are preserved exactly.
+    // The persistent shell runs through a PTY and normalizes output for
+    // streaming, which is fine for text commands but corrupts binary reads.
+    return this.queue.enqueue(() =>
+      sshExec(this.connection.remote, this.connection.port, `cat -- ${shellQuote(remotePath)}`, {
+        timeoutSeconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
+      }),
+    );
   }
 
   async ensureReadable(remotePath: string): Promise<void> {
