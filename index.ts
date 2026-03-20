@@ -118,13 +118,33 @@ function mapLocalPathToRemote(path: string, conn: SshConnection): string {
   return path;
 }
 
+function findRemotePathSeparator(value: string): number {
+  const colonIndex = value.lastIndexOf(":");
+  if (colonIndex === -1) {
+    return -1;
+  }
+
+  const remotePath = value.slice(colonIndex + 1).trim();
+  if (remotePath.startsWith("/") || remotePath === "~" || remotePath.startsWith("~/")) {
+    return colonIndex;
+  }
+
+  // Preserve host:relative-path for the common single-colon form, but avoid
+  // mis-parsing IPv6 literals without an explicit remote path.
+  if (value.indexOf(":") === colonIndex) {
+    return colonIndex;
+  }
+
+  return -1;
+}
+
 function parseSshFlag(raw: string): { remote: string; remotePath?: string } {
   const value = raw.trim();
   if (!value) {
     throw new Error("--ssh requires a value like user@host or user@host:/remote/path");
   }
 
-  const colonIndex = value.indexOf(":");
+  const colonIndex = findRemotePathSeparator(value);
   if (colonIndex === -1) {
     return { remote: value };
   }
