@@ -629,7 +629,9 @@ class SshTransport implements RemoteTransport {
     }
 
     await this.queue.enqueue(async () => {
-      await sshExec(this.connection.remote, this.connection.port, `cat > ${shellQuote(remotePath)}`, {
+      const remoteDir = remoteDirname(remotePath);
+      const command = [`mkdir -p -- ${shellQuote(remoteDir)}`, `cat > ${shellQuote(remotePath)}`].join(" && ");
+      await sshExec(this.connection.remote, this.connection.port, command, {
         stdin: content,
       });
     });
