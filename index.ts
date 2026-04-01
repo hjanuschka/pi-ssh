@@ -505,9 +505,19 @@ class PersistentRemoteShell {
     // stdin (e.g., bare `wc`, `read`, `cat` without args) get EOF immediately
     // instead of blocking forever on the PTY. Shell pipelines still work
     // because the pipe overrides stdin for downstream commands.
+    //
+    // If the command contains newlines (e.g. multi-line git commit -m "..."),
+    // base64-encode it so the entire wrapper stays on a single PTY line.
+    // Otherwise the PTY interprets embedded newlines as separate command
+    // submissions and the end marker is never reached, hanging the session.
+    const needsEncoding = command.includes("\n");
+    const execPart = needsEncoding
+      ? `eval "$(printf '%s' '${Buffer.from(command).toString("base64")}' | base64 -d)"`
+      : `{ ${command}; }`;
+
     const wrappedCommand = [
       `printf '${startMarker}\\n'`,
-      `if cd -- ${shellQuote(remoteCwd)}; then { ${command}; } </dev/null; __pi_ec=$?; else __pi_ec=$?; fi`,
+      `if cd -- ${shellQuote(remoteCwd)}; then ${execPart} </dev/null; __pi_ec=$?; else __pi_ec=$?; fi`,
       `printf '\\n${endMarker}:%s\\n' \"$__pi_ec\"`,
     ].join("; ");
 
