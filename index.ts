@@ -823,6 +823,7 @@ export default function piSshExtension(pi: ExtensionAPI): void {
 
   let connection: SshConnection | null = null;
   let transport: SshTransport | null = null;
+  let remoteContextSection = "";
 
   const getConnection = () => connection;
 
@@ -900,6 +901,26 @@ export default function piSshExtension(pi: ExtensionAPI): void {
         );
         ctx.ui.notify(enabledMessage, "info");
       }
+
+      // Load remote context file (AGENTS.md or CLAUDE.md) from remote cwd
+      try {
+        for (const name of ["AGENTS.md", "CLAUDE.md"]) {
+          try {
+            const content = (await transport.readFile(`${connection.remoteCwd}/${name}`)).toString("utf-8").trim();
+            if (content) {
+              remoteContextSection = `\n\n# Remote Project Context\n\n## ${connection.remoteCwd}/${name}\n\n${content}\n`;
+              if (ctx.hasUI) {
+                ctx.ui.notify(`Loaded remote context file: ${name}`, "info");
+              }
+              break;
+            }
+          } catch {
+            // not found, try next
+          }
+        }
+      } catch {
+        // skip context loading on error
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       connection = null;
@@ -936,8 +957,12 @@ export default function piSshExtension(pi: ExtensionAPI): void {
     const remotePrefix = `Current working directory: ${conn.remoteCwd} (via SSH ${conn.remote}, port ${conn.port})`;
 
     if (!event.systemPrompt.includes(localPrefix)) return;
+    let modified = event.systemPrompt.replace(localPrefix, remotePrefix);
+    if (remoteContextSection) {
+      modified += remoteContextSection;
+    }
     return {
-      systemPrompt: event.systemPrompt.replace(localPrefix, remotePrefix),
+      systemPrompt: modified,
     };
   });
 }
