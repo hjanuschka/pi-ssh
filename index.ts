@@ -56,7 +56,7 @@ function parseDelimitedShellOutput(
   startMarker: string,
   endMarker: string,
 ): { output: string; exitCode: number | null } | null {
-  const text = stdoutText.replace(/\r\n/g, "\n");
+  const text = stdoutText.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 
   const endRegex = new RegExp(`(^|\\n)${escapeRegex(endMarker)}:(-?\\d+)(?=\\n|$)`);
   const endMatch = endRegex.exec(text);
@@ -355,12 +355,12 @@ class PersistentRemoteShell {
   }
 
   /**
-   * Normalize raw PTY output the same way parseDelimitedShellOutput does:
-   * replace \r\n with \n. Bare \r is left intact so byte counts match
-   * the parsed output exactly.
+   * Normalize raw PTY output the same way parseDelimitedShellOutput does.
+   * Some remote shells emit bare carriage returns before prompt/control
+   * sequences; treat those as line breaks so command markers are found.
    */
   private normalize(text: string): string {
-    return text.replace(/\r\n/g, "\n");
+    return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   }
 
   /**
