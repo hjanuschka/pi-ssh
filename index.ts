@@ -58,26 +58,30 @@ function parseDelimitedShellOutput(
 ): { output: string; exitCode: number | null } | null {
   const text = stdoutText.replace(/\r\n/g, "\n");
 
-  const endRegex = new RegExp(`(^|\\n)${escapeRegex(endMarker)}:(-?\\d+)(?=\\n|$)`);
+  // Interactive shells may emit terminal control sequences immediately before
+  // markers (for example OSC 3008 shell context or DECSCUSR cursor shape).
+  // The markers contain a random per-command ID, so matching them anywhere is
+  // safe and avoids requiring them to begin at a clean terminal line.
+  const endRegex = new RegExp(`${escapeRegex(endMarker)}:(-?\\d+)(?=\\n|$)`);
   const endMatch = endRegex.exec(text);
   if (!endMatch) {
     return null;
   }
 
-  const endLineStart = endMatch.index + endMatch[1].length;
+  const endLineStart = endMatch.index;
 
-  const startRegex = new RegExp(`(^|\\n)${escapeRegex(startMarker)}(?=\\n|$)`, "g");
+  const startRegex = new RegExp(escapeRegex(startMarker), "g");
   let startLineEnd = 0;
   let foundStart = false;
   while (true) {
     const startMatch = startRegex.exec(text);
     if (!startMatch) break;
 
-    const startLineStart = startMatch.index + startMatch[1].length;
-    if (startLineStart >= endLineStart) break;
+    const startMarkerStart = startMatch.index;
+    if (startMarkerStart >= endLineStart) break;
 
     foundStart = true;
-    startLineEnd = startLineStart + startMarker.length;
+    startLineEnd = startMarkerStart + startMarker.length;
     if (text[startLineEnd] === "\n") {
       startLineEnd += 1;
     }
@@ -88,7 +92,7 @@ function parseDelimitedShellOutput(
   }
 
   const output = text.slice(startLineEnd, endLineStart);
-  const parsedExitCode = Number(endMatch[2]);
+  const parsedExitCode = Number(endMatch[1]);
   const exitCode = Number.isNaN(parsedExitCode) ? null : parsedExitCode;
   return { output, exitCode };
 }
@@ -332,7 +336,7 @@ class PersistentRemoteShell {
 
     this.child = child;
     this.child.stdin.write(
-      "stty -echo 2>/dev/null || true; unset PROMPT_COMMAND 2>/dev/null || true; PS1=''; PS2=''; PROMPT=''; RPROMPT=''; " +
+      "stty -echo 2>/dev/null || true; unset PROMPT_COMMAND 2>/dev/null || true; PS0=''; PS1=''; PS2=''; PROMPT=''; RPROMPT=''; " +
         "export PAGER=cat; export GIT_PAGER=cat; export GIT_TERMINAL_PROMPT=0; " +
         "if [ -n \"${ZSH_VERSION-}\" ]; then precmd_functions=(); preexec_functions=(); chpwd_functions=(); unset zle_bracketed_paste 2>/dev/null || true; fi; " +
         "if [ -n \"${BASH_VERSION-}\" ]; then bind 'set enable-bracketed-paste off' 2>/dev/null || true; fi\n",
@@ -380,11 +384,11 @@ class PersistentRemoteShell {
 
     // Wait until we've seen the start marker before streaming anything
     if (!this.seenStartMarker) {
-      const startRegex = new RegExp(`(^|\\n)${escapeRegex(running.startMarker)}\\n`);
-      const startMatch = startRegex.exec(text);
-      if (!startMatch) return;
+      const markerIndex = text.indexOf(running.startMarker);
+      if (markerIndex < 0) return;
       this.seenStartMarker = true;
-      this.startMarkerEnd = startMatch.index + startMatch[0].length;
+      this.startMarkerEnd = markerIndex + running.startMarker.length;
+      if (text[this.startMarkerEnd] === "\n") this.startMarkerEnd += 1;
       this.streamedBytes = 0;
     }
 
@@ -418,6 +422,14 @@ class PersistentRemoteShell {
       if (outputSoFar.includes(endMarkerPrefix) || endMarkerPrefix.startsWith(outputSoFar.trimEnd())) {
         safeLen = 0;
       }
+    }
+
+    // Shell integrations may append control sequences after the complete end
+    // marker, making it no longer appear to be the final line. Never stream
+    // the randomized marker or anything following it.
+    const completeEndMarker = outputSoFar.indexOf(running.endMarker);
+    if (completeEndMarker >= 0) {
+      safeLen = Math.min(safeLen, completeEndMarker);
     }
 
     if (safeLen > this.streamedBytes) {
@@ -549,6 +561,14 @@ class PersistentRemoteShell {
         running.timeoutHandle = setTimeout(() => {
           running.timedOut = true;
           this.interruptCurrentCommand();
+
+          // Do not wait forever for a marker from a shell whose output cannot be parsed.
+          setTimeout(() => {
+            if (this.running !== running) return;
+            if (this.child && !this.child.killed) this.child.kill();
+            this.cleanupRunning();
+            running.reject(new Error(`timeout:${effectiveTimeout}`));
+          }, 500);
         }, effectiveTimeout * 1000);
       }
 
