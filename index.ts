@@ -14,7 +14,9 @@ import {
 
 interface SshConnection {
   remote: string;
-  port: number;
+  // Undefined means "not specified explicitly"; ssh then resolves the port
+  // from ~/.ssh/config.
+  port: number | undefined;
   remoteCwd: string;
   remoteHome: string;
   localCwd: string;
@@ -62,7 +64,8 @@ function parseDelimitedShellOutput(
   // markers (for example OSC 3008 shell context or DECSCUSR cursor shape).
   // The markers contain a random per-command ID, so matching them anywhere is
   // safe and avoids requiring them to begin at a clean terminal line.
-  const endRegex = new RegExp(`${escapeRegex(endMarker)}:(-?\\d+)(?=\\n|$)`);
+  // Tolerate a bare CR after the exit code (some PTYs emit \r without \n).
+  const endRegex = new RegExp(`${escapeRegex(endMarker)}:(-?\\d+)(?=[\\r\\n]|$)`);
   const endMatch = endRegex.exec(text);
   if (!endMatch) {
     return null;
@@ -164,8 +167,10 @@ function parseSshFlag(raw: string): { remote: string; remotePath?: string } {
   return { remote, remotePath };
 }
 
-function parseSshPort(raw: string | undefined): number {
-  const value = (raw ?? "22").trim();
+function parseSshPort(raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  const value = raw.trim();
+  if (!value) return undefined;
   const parsed = Number.parseInt(value, 10);
   if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
     throw new Error(`Invalid SSH port: ${value}`);
@@ -173,17 +178,22 @@ function parseSshPort(raw: string | undefined): number {
   return parsed;
 }
 
-function buildSshBaseArgs(port: number): string[] {
-  return [
-    "-p",
-    String(port),
+function buildSshBaseArgs(port: number | undefined): string[] {
+  const args: string[] = [];
+  // Only pass -p when a port was given explicitly, so ~/.ssh/config
+  // Port settings apply otherwise.
+  if (port !== undefined) {
+    args.push("-p", String(port));
+  }
+  args.push(
     "-o",
     "ControlMaster=auto",
     "-o",
     "ControlPersist=600",
     "-o",
     "ControlPath=/tmp/pi-ssh-%C",
-  ];
+  );
+  return args;
 }
 
 function buildResolveRemotePathCommand(remotePath: string): string {
@@ -198,7 +208,7 @@ function buildResolveRemotePathCommand(remotePath: string): string {
 
 async function sshCapture(
   remote: string,
-  port: number,
+  port: number | undefined,
   remoteCommand: string,
   options: SshCaptureOptions = {},
 ): Promise<{ stdout: Buffer; stderr: Buffer; exitCode: number | null; timedOut: boolean }> {
@@ -255,7 +265,7 @@ async function sshCapture(
   });
 }
 
-async function sshExec(remote: string, port: number, remoteCommand: string, options: SshCaptureOptions = {}): Promise<Buffer> {
+async function sshExec(remote: string, port: number | undefined, remoteCommand: string, options: SshCaptureOptions = {}): Promise<Buffer> {
   const result = await sshCapture(remote, port, remoteCommand, options);
   if (result.timedOut) {
     throw new Error(`SSH command timed out after ${options.timeoutSeconds ?? 0}s`);
@@ -780,7 +790,7 @@ function createRemoteBashOps(transport: RemoteTransport): BashOperations {
   };
 }
 
-async function resolveSshConnection(rawFlag: string, localCwd: string, localHome: string, port: number): Promise<SshConnection> {
+async function resolveSshConnection(rawFlag: string, localCwd: string, localHome: string, port: number | undefined): Promise<SshConnection> {
   const parsed = parseSshFlag(rawFlag);
 
   const remoteHomeBuffer = await sshExec(parsed.remote, port, 'printf "%s" "$HOME"', {
@@ -824,9 +834,8 @@ export default function piSshExtension(pi: ExtensionAPI): void {
     type: "string",
   });
   pi.registerFlag("ssh-port", {
-    description: "SSH port (default: 22)",
+    description: "SSH port (default: from ~/.ssh/config, else 22)",
     type: "string",
-    default: "22",
   });
   pi.registerFlag("p", {
     description: "Alias for --ssh-port",
@@ -912,12 +921,13 @@ export default function piSshExtension(pi: ExtensionAPI): void {
       const port = parseSshPort(rawPort);
       connection = await resolveSshConnection(flag, localCwd, localHome, port);
       transport = new SshTransport(connection);
-      const enabledMessage = `pi-ssh enabled: ${connection.remote}:${connection.remoteCwd} (port ${connection.port})`;
+      const portSuffix = connection.port !== undefined ? ` (port ${connection.port})` : "";
+      const enabledMessage = `pi-ssh enabled: ${connection.remote}:${connection.remoteCwd}${portSuffix}`;
       console.log(enabledMessage);
       if (ctx.hasUI) {
         ctx.ui.setStatus(
           "pi-ssh",
-          ctx.ui.theme.fg("accent", `SSH ${connection.remote}:${connection.remoteCwd} (port ${connection.port})`),
+          ctx.ui.theme.fg("accent", `SSH ${connection.remote}:${connection.remoteCwd}${portSuffix}`),
         );
         ctx.ui.notify(enabledMessage, "info");
       }
@@ -974,7 +984,7 @@ export default function piSshExtension(pi: ExtensionAPI): void {
     if (!conn) return;
 
     const localPrefix = `Current working directory: ${localCwd}`;
-    const remotePrefix = `Current working directory: ${conn.remoteCwd} (via SSH ${conn.remote}, port ${conn.port})`;
+    const remotePrefix = `Current working directory: ${conn.remoteCwd} (via SSH ${conn.remote}${conn.port !== undefined ? `, port ${conn.port}` : ""})`;
 
     if (!event.systemPrompt.includes(localPrefix)) return;
     let modified = event.systemPrompt.replace(localPrefix, remotePrefix);

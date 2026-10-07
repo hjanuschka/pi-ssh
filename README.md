@@ -19,7 +19,8 @@ This is useful when:
 ## Features
 
 - `--ssh user@host` or `--ssh user@host:/remote/path`
-- optional port: `--ssh-port 2222` (alias: `-p 2222`, default: `22`)
+- optional port: `--ssh-port 2222` (alias: `-p 2222`); if not set, the port from `~/.ssh/config` is used (else 22)
+- Remote context files: `AGENTS.md` / `CLAUDE.md` from the remote working directory are loaded into the system prompt
 - Remote tool delegation for:
   - `read`
   - `write`
@@ -45,7 +46,13 @@ This is useful when:
 
 ## Install
 
-### Option A: project-local extension
+### Option A: pi package (recommended)
+
+```bash
+pi install npm:pi-ssh
+```
+
+### Option B: project-local extension
 
 ```bash
 mkdir -p .pi/extensions
@@ -54,7 +61,7 @@ cp /path/to/pi-ssh/index.ts .pi/extensions/pi-ssh.ts
 
 Then start pi in your project and pass `--ssh`.
 
-### Option B: global extension
+### Option C: global extension
 
 ```bash
 mkdir -p ~/.pi/agent/extensions
@@ -70,6 +77,9 @@ pi --ssh user@my-vm
 # same, explicit default
 pi --ssh user@my-vm --ssh-port 22
 ```
+
+If the host has a `Port` entry in `~/.ssh/config` and you don't pass
+`--ssh-port`, that port is used.
 
 ### Use explicit remote workspace path
 
@@ -97,6 +107,8 @@ SSH user@my-vm:/home/user/chromium/src (port 22)
 - Absolute paths are strongly recommended for the remote path.
 - Paths under local `$HOME` are mapped to remote `$HOME` in SSH mode (for example `~/.config/...`).
 - If `--ssh` is not set, extension falls back to local tool behavior.
+- `AGENTS.md` (preferred) or `CLAUDE.md` in the remote cwd is appended to the
+  system prompt as remote project context, after any local context.
 - Current version focuses on core coding tools (`read/write/edit/bash`).
 
 ## Troubleshooting
