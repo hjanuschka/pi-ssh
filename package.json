@@ -1,6 +1,6 @@
 {
   "name": "pi-ssh",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "pi extension for local-model plus remote SSH workspace tool execution",
   "type": "module",
   "private": false,
@@ -36,6 +36,6 @@
     ]
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*"
   }
 }

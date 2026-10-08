@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { homedir } from "node:os";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   createBashTool,
   createEditTool,
@@ -10,11 +10,13 @@ import {
   type EditOperations,
   type ReadOperations,
   type WriteOperations,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 
 interface SshConnection {
   remote: string;
-  port: number;
+  // Undefined means "not specified explicitly"; ssh then resolves the port
+  // from ~/.ssh/config.
+  port: number | undefined;
   remoteCwd: string;
   remoteHome: string;
   localCwd: string;
@@ -58,26 +60,31 @@ function parseDelimitedShellOutput(
 ): { output: string; exitCode: number | null } | null {
   const text = stdoutText.replace(/\r\n/g, "\n");
 
-  const endRegex = new RegExp(`(^|\\n)${escapeRegex(endMarker)}:(-?\\d+)(?=\\n|$)`);
+  // Interactive shells may emit terminal control sequences immediately before
+  // markers (for example OSC 3008 shell context or DECSCUSR cursor shape).
+  // The markers contain a random per-command ID, so matching them anywhere is
+  // safe and avoids requiring them to begin at a clean terminal line.
+  // Tolerate a bare CR after the exit code (some PTYs emit \r without \n).
+  const endRegex = new RegExp(`${escapeRegex(endMarker)}:(-?\\d+)(?=[\\r\\n]|$)`);
   const endMatch = endRegex.exec(text);
   if (!endMatch) {
     return null;
   }
 
-  const endLineStart = endMatch.index + endMatch[1].length;
+  const endLineStart = endMatch.index;
 
-  const startRegex = new RegExp(`(^|\\n)${escapeRegex(startMarker)}(?=\\n|$)`, "g");
+  const startRegex = new RegExp(escapeRegex(startMarker), "g");
   let startLineEnd = 0;
   let foundStart = false;
   while (true) {
     const startMatch = startRegex.exec(text);
     if (!startMatch) break;
 
-    const startLineStart = startMatch.index + startMatch[1].length;
-    if (startLineStart >= endLineStart) break;
+    const startMarkerStart = startMatch.index;
+    if (startMarkerStart >= endLineStart) break;
 
     foundStart = true;
-    startLineEnd = startLineStart + startMarker.length;
+    startLineEnd = startMarkerStart + startMarker.length;
     if (text[startLineEnd] === "\n") {
       startLineEnd += 1;
     }
@@ -88,7 +95,7 @@ function parseDelimitedShellOutput(
   }
 
   const output = text.slice(startLineEnd, endLineStart);
-  const parsedExitCode = Number(endMatch[2]);
+  const parsedExitCode = Number(endMatch[1]);
   const exitCode = Number.isNaN(parsedExitCode) ? null : parsedExitCode;
   return { output, exitCode };
 }
@@ -160,8 +167,10 @@ function parseSshFlag(raw: string): { remote: string; remotePath?: string } {
   return { remote, remotePath };
 }
 
-function parseSshPort(raw: string | undefined): number {
-  const value = (raw ?? "22").trim();
+function parseSshPort(raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  const value = raw.trim();
+  if (!value) return undefined;
   const parsed = Number.parseInt(value, 10);
   if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
     throw new Error(`Invalid SSH port: ${value}`);
@@ -169,17 +178,22 @@ function parseSshPort(raw: string | undefined): number {
   return parsed;
 }
 
-function buildSshBaseArgs(port: number): string[] {
-  return [
-    "-p",
-    String(port),
+function buildSshBaseArgs(port: number | undefined): string[] {
+  const args: string[] = [];
+  // Only pass -p when a port was given explicitly, so ~/.ssh/config
+  // Port settings apply otherwise.
+  if (port !== undefined) {
+    args.push("-p", String(port));
+  }
+  args.push(
     "-o",
     "ControlMaster=auto",
     "-o",
     "ControlPersist=600",
     "-o",
     "ControlPath=/tmp/pi-ssh-%C",
-  ];
+  );
+  return args;
 }
 
 function buildResolveRemotePathCommand(remotePath: string): string {
@@ -194,7 +208,7 @@ function buildResolveRemotePathCommand(remotePath: string): string {
 
 async function sshCapture(
   remote: string,
-  port: number,
+  port: number | undefined,
   remoteCommand: string,
   options: SshCaptureOptions = {},
 ): Promise<{ stdout: Buffer; stderr: Buffer; exitCode: number | null; timedOut: boolean }> {
@@ -251,7 +265,7 @@ async function sshCapture(
   });
 }
 
-async function sshExec(remote: string, port: number, remoteCommand: string, options: SshCaptureOptions = {}): Promise<Buffer> {
+async function sshExec(remote: string, port: number | undefined, remoteCommand: string, options: SshCaptureOptions = {}): Promise<Buffer> {
   const result = await sshCapture(remote, port, remoteCommand, options);
   if (result.timedOut) {
     throw new Error(`SSH command timed out after ${options.timeoutSeconds ?? 0}s`);
@@ -332,7 +346,7 @@ class PersistentRemoteShell {
 
     this.child = child;
     this.child.stdin.write(
-      "stty -echo 2>/dev/null || true; unset PROMPT_COMMAND 2>/dev/null || true; PS1=''; PS2=''; PROMPT=''; RPROMPT=''; " +
+      "stty -echo 2>/dev/null || true; unset PROMPT_COMMAND 2>/dev/null || true; PS0=''; PS1=''; PS2=''; PROMPT=''; RPROMPT=''; " +
         "export PAGER=cat; export GIT_PAGER=cat; export GIT_TERMINAL_PROMPT=0; " +
         "if [ -n \"${ZSH_VERSION-}\" ]; then precmd_functions=(); preexec_functions=(); chpwd_functions=(); unset zle_bracketed_paste 2>/dev/null || true; fi; " +
         "if [ -n \"${BASH_VERSION-}\" ]; then bind 'set enable-bracketed-paste off' 2>/dev/null || true; fi\n",
@@ -380,11 +394,11 @@ class PersistentRemoteShell {
 
     // Wait until we've seen the start marker before streaming anything
     if (!this.seenStartMarker) {
-      const startRegex = new RegExp(`(^|\\n)${escapeRegex(running.startMarker)}\\n`);
-      const startMatch = startRegex.exec(text);
-      if (!startMatch) return;
+      const markerIndex = text.indexOf(running.startMarker);
+      if (markerIndex < 0) return;
       this.seenStartMarker = true;
-      this.startMarkerEnd = startMatch.index + startMatch[0].length;
+      this.startMarkerEnd = markerIndex + running.startMarker.length;
+      if (text[this.startMarkerEnd] === "\n") this.startMarkerEnd += 1;
       this.streamedBytes = 0;
     }
 
@@ -418,6 +432,14 @@ class PersistentRemoteShell {
       if (outputSoFar.includes(endMarkerPrefix) || endMarkerPrefix.startsWith(outputSoFar.trimEnd())) {
         safeLen = 0;
       }
+    }
+
+    // Shell integrations may append control sequences after the complete end
+    // marker, making it no longer appear to be the final line. Never stream
+    // the randomized marker or anything following it.
+    const completeEndMarker = outputSoFar.indexOf(running.endMarker);
+    if (completeEndMarker >= 0) {
+      safeLen = Math.min(safeLen, completeEndMarker);
     }
 
     if (safeLen > this.streamedBytes) {
@@ -549,6 +571,14 @@ class PersistentRemoteShell {
         running.timeoutHandle = setTimeout(() => {
           running.timedOut = true;
           this.interruptCurrentCommand();
+
+          // Do not wait forever for a marker from a shell whose output cannot be parsed.
+          setTimeout(() => {
+            if (this.running !== running) return;
+            if (this.child && !this.child.killed) this.child.kill();
+            this.cleanupRunning();
+            running.reject(new Error(`timeout:${effectiveTimeout}`));
+          }, 500);
         }, effectiveTimeout * 1000);
       }
 
@@ -760,7 +790,7 @@ function createRemoteBashOps(transport: RemoteTransport): BashOperations {
   };
 }
 
-async function resolveSshConnection(rawFlag: string, localCwd: string, localHome: string, port: number): Promise<SshConnection> {
+async function resolveSshConnection(rawFlag: string, localCwd: string, localHome: string, port: number | undefined): Promise<SshConnection> {
   const parsed = parseSshFlag(rawFlag);
 
   const remoteHomeBuffer = await sshExec(parsed.remote, port, 'printf "%s" "$HOME"', {
@@ -804,9 +834,8 @@ export default function piSshExtension(pi: ExtensionAPI): void {
     type: "string",
   });
   pi.registerFlag("ssh-port", {
-    description: "SSH port (default: 22)",
+    description: "SSH port (default: from ~/.ssh/config, else 22)",
     type: "string",
-    default: "22",
   });
   pi.registerFlag("p", {
     description: "Alias for --ssh-port",
@@ -823,6 +852,7 @@ export default function piSshExtension(pi: ExtensionAPI): void {
 
   let connection: SshConnection | null = null;
   let transport: SshTransport | null = null;
+  let remoteContextSection = "";
 
   const getConnection = () => connection;
 
@@ -891,14 +921,35 @@ export default function piSshExtension(pi: ExtensionAPI): void {
       const port = parseSshPort(rawPort);
       connection = await resolveSshConnection(flag, localCwd, localHome, port);
       transport = new SshTransport(connection);
-      const enabledMessage = `pi-ssh enabled: ${connection.remote}:${connection.remoteCwd} (port ${connection.port})`;
+      const portSuffix = connection.port !== undefined ? ` (port ${connection.port})` : "";
+      const enabledMessage = `pi-ssh enabled: ${connection.remote}:${connection.remoteCwd}${portSuffix}`;
       console.log(enabledMessage);
       if (ctx.hasUI) {
         ctx.ui.setStatus(
           "pi-ssh",
-          ctx.ui.theme.fg("accent", `SSH ${connection.remote}:${connection.remoteCwd} (port ${connection.port})`),
+          ctx.ui.theme.fg("accent", `SSH ${connection.remote}:${connection.remoteCwd}${portSuffix}`),
         );
         ctx.ui.notify(enabledMessage, "info");
+      }
+
+      // Load remote context file (AGENTS.md or CLAUDE.md) from remote cwd
+      try {
+        for (const name of ["AGENTS.md", "CLAUDE.md"]) {
+          try {
+            const content = (await transport.readFile(`${connection.remoteCwd}/${name}`)).toString("utf-8").trim();
+            if (content) {
+              remoteContextSection = `\n\n# Remote Project Context\n\n## ${connection.remoteCwd}/${name}\n\n${content}\n`;
+              if (ctx.hasUI) {
+                ctx.ui.notify(`Loaded remote context file: ${name}`, "info");
+              }
+              break;
+            }
+          } catch {
+            // not found, try next
+          }
+        }
+      } catch {
+        // skip context loading on error
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -933,11 +984,15 @@ export default function piSshExtension(pi: ExtensionAPI): void {
     if (!conn) return;
 
     const localPrefix = `Current working directory: ${localCwd}`;
-    const remotePrefix = `Current working directory: ${conn.remoteCwd} (via SSH ${conn.remote}, port ${conn.port})`;
+    const remotePrefix = `Current working directory: ${conn.remoteCwd} (via SSH ${conn.remote}${conn.port !== undefined ? `, port ${conn.port}` : ""})`;
 
     if (!event.systemPrompt.includes(localPrefix)) return;
+    let modified = event.systemPrompt.replace(localPrefix, remotePrefix);
+    if (remoteContextSection) {
+      modified += remoteContextSection;
+    }
     return {
-      systemPrompt: event.systemPrompt.replace(localPrefix, remotePrefix),
+      systemPrompt: modified,
     };
   });
 }
