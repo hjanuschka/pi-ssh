@@ -346,7 +346,7 @@ class PersistentRemoteShell {
 
     this.child = child;
     this.child.stdin.write(
-      "stty -echo 2>/dev/null || true; unset PROMPT_COMMAND 2>/dev/null || true; PS0=''; PS1=''; PS2=''; PROMPT=''; RPROMPT=''; " +
+      "stty -echo isig intr '^C' 2>/dev/null || true; unset PROMPT_COMMAND 2>/dev/null || true; PS0=''; PS1=''; PS2=''; PROMPT=''; RPROMPT=''; " +
         "export PAGER=cat; export GIT_PAGER=cat; export GIT_TERMINAL_PROMPT=0; " +
         "if [ -n \"${ZSH_VERSION-}\" ]; then precmd_functions=(); preexec_functions=(); chpwd_functions=(); unset zle_bracketed_paste 2>/dev/null || true; fi; " +
         "if [ -n \"${BASH_VERSION-}\" ]; then bind 'set enable-bracketed-paste off' 2>/dev/null || true; fi\n",
@@ -586,6 +586,16 @@ class PersistentRemoteShell {
         running.abortHandler = () => {
           running.aborted = true;
           this.interruptCurrentCommand();
+
+          // A Ctrl-C over a raw PTY interrupts the foreground command, but
+          // bash often aborts the rest of the `;`-joined wrapper instead of
+          // continuing to the end-marker printf. Reject promptly so an
+          // interrupted command cannot hang until the 300s timeout.
+          setTimeout(() => {
+            if (this.running !== running) return;
+            this.cleanupRunning();
+            running.reject(new Error("aborted"));
+          }, 500);
         };
 
         if (options.signal.aborted) {
